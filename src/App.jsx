@@ -253,7 +253,13 @@ const Styles = () => (
       pointer-events:none;
     }
 
-    @keyframes shimmerArrow{0%,100%{opacity:0.3;transform:translateX(0)}50%{opacity:1;transform:translateX(4px)}}
+    /* Torn top flies away */
+    @keyframes tearFly{
+      0%{transform:translateY(0) rotate(0deg) scale(1);opacity:1}
+      30%{transform:translateY(-40px) rotate(-8deg) scale(1.02);opacity:0.9}
+      100%{transform:translateY(-200px) rotate(-25deg) scale(0.7);opacity:0}
+    }
+    .tear-fly{animation:tearFly 0.6s ${T.easeOut} forwards}
 
     ::-webkit-scrollbar{width:6px}
     ::-webkit-scrollbar-track{background:transparent}
@@ -315,148 +321,22 @@ const CardBackDesign = ({ width = "100%", height = "100%" }) => (
 
 // ─── Pack Opening ───────────────────────────────────
 
-// Seeded random for deterministic jagged tear edge
-const seededRand = (seed) => {
-  let s = seed;
-  return () => { s = (s * 16807 + 0) % 2147483647; return (s - 1) / 2147483646; };
-};
-
-// Generate a static jagged tear path (SVG polygon points)
-const TEAR_SEED = 42;
-const makeTearPath = (w, baseY, amplitude, segments) => {
-  const rng = seededRand(TEAR_SEED);
-  const pts = [];
-  for (let i = 0; i <= segments; i++) {
-    const x = (i / segments) * w;
-    const jag = (rng() - 0.5) * 2 * amplitude;
-    pts.push(`${x},${baseY + jag}`);
-  }
-  return pts;
-};
-
-const RIP_DISTANCE = 130;
 const FLAP_PCT = 0.20;
 
 const PackHero = ({ opened, ripping, onRip }) => {
   const [hov, setHov] = useState(false);
-  const packRef = useRef(null);
-  const progressRef = useRef(0);
-  const [, forceRender] = useState(0);
-  const [dragging, setDragging] = useState(false);
-  const [finishing, setFinishing] = useState(false);
-  const dragStart = useRef({ x: 0, y: 0 });
-  const lastCrinkleAt = useRef(0);
-  const [particles, setParticles] = useState([]);
-  const particleId = useRef(0);
-  const rafRef = useRef(null);
-
-  const progress = progressRef.current;
+  const [torn, setTorn] = useState(false); // top has been ripped off
 
   const packW = 240;
   const packH = packW * CARD_RATIO;
   const flapH = packH * FLAP_PCT;
-  const tearPts = useRef(makeTearPath(packW, flapH, 4, 16)).current;
 
-  // Build SVG clip paths from the jagged tear line
-  const tearTop = `0,0 ${packW},0 ${packW},${flapH - 6} ${[...tearPts].reverse().join(" ")} 0,${flapH - 6}`;
-  const tearBottom = `${tearPts.join(" ")} ${packW},${flapH - 6} ${packW},${packH} 0,${packH} 0,${flapH - 6}`;
-
-  // Emit foil confetti
-  const emitParticles = useCallback((count = 1) => {
-    const now = Date.now();
-    if (now - lastCrinkleAt.current < 35) return;
-    lastCrinkleAt.current = now;
-    const colors = ["#e84393", "#6b5ce7", "#00b4d8", "#d4a017", "#fff", "#f8b4d9", "#a78bfa"];
-    const newP = [];
-    for (let i = 0; i < count; i++) {
-      const id = particleId.current++;
-      newP.push({
-        id, color: colors[id % colors.length],
-        left: 5 + Math.random() * 90,
-        size: 2 + Math.random() * 3,
-        px: (Math.random() - 0.5) * 70,
-        py: -20 - Math.random() * 60,
-        rot: Math.random() * 360,
-        dur: 0.4 + Math.random() * 0.4,
-      });
-    }
-    setParticles(prev => [...prev.slice(-24), ...newP]);
-    newP.forEach(p => setTimeout(() => setParticles(prev => prev.filter(pp => pp.id !== p.id)), p.dur * 1000));
-
-    // Crinkle SFX
-    try {
-      const ctx = getAudio();
-      const t = ctx.currentTime;
-      const n = ctx.createBufferSource();
-      n.buffer = makeNoise(ctx, 0.08);
-      const bp = ctx.createBiquadFilter();
-      bp.type = "bandpass"; bp.frequency.value = 3500 + Math.random() * 3000; bp.Q.value = 1.2;
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(0.05 + Math.random() * 0.05, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.07);
-      n.connect(bp); bp.connect(g); g.connect(ctx.destination);
-      n.start(t);
-    } catch (e) {}
-  }, []);
-
-  const getClientPos = (e) => {
-    if (e.touches && e.touches.length > 0) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
-    return { x: e.clientX, y: e.clientY };
+  const handleRip = () => {
+    if (torn || opened) return;
+    setTorn(true);
+    playRipSFX();
+    setTimeout(() => onRip(), 800);
   };
-
-  const handlePointerDown = useCallback((e) => {
-    if (ripping || opened || finishing) return;
-    if (!packRef.current) return;
-    const rect = packRef.current.getBoundingClientRect();
-    const pos = getClientPos(e);
-    if ((pos.y - rect.top) / rect.height > 0.4) return;
-    e.preventDefault();
-    dragStart.current = { x: pos.x, y: pos.y };
-    setDragging(true);
-  }, [ripping, opened, finishing]);
-
-  const handlePointerMove = useCallback((e) => {
-    if (!dragging || finishing) return;
-    e.preventDefault();
-    const pos = getClientPos(e);
-    const dx = pos.x - dragStart.current.x;
-    const dy = dragStart.current.y - pos.y;
-    const dist = Math.max(0, dx * 0.6 + dy * 0.9 + Math.abs(dx) * 0.15);
-    const newP = Math.min(1, dist / RIP_DISTANCE);
-    if (newP > progressRef.current) {
-      const delta = newP - progressRef.current;
-      progressRef.current = newP;
-      emitParticles(delta > 0.06 ? 3 : delta > 0.03 ? 2 : 1);
-      if (!rafRef.current) {
-        rafRef.current = requestAnimationFrame(() => { rafRef.current = null; forceRender(n => n + 1); });
-      }
-    }
-  }, [dragging, finishing, emitParticles]);
-
-  const handlePointerUp = useCallback(() => {
-    if (!dragging) return;
-    setDragging(false);
-    if (progressRef.current >= 0.8) {
-      setFinishing(true);
-      progressRef.current = 1;
-      playRipSFX();
-      // Burst of confetti
-      for (let i = 0; i < 5; i++) setTimeout(() => emitParticles(3), i * 40);
-      forceRender(n => n + 1);
-      setTimeout(() => onRip(), 150);
-    }
-  }, [dragging, onRip, emitParticles]);
-
-  useEffect(() => {
-    if (!dragging) return;
-    const move = (e) => handlePointerMove(e);
-    const up = () => handlePointerUp();
-    window.addEventListener("mousemove", move, { passive: false });
-    window.addEventListener("mouseup", up);
-    window.addEventListener("touchmove", move, { passive: false });
-    window.addEventListener("touchend", up);
-    return () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); window.removeEventListener("touchmove", move); window.removeEventListener("touchend", up); };
-  }, [dragging, handlePointerMove, handlePointerUp]);
 
   if (opened) {
     return (
@@ -472,207 +352,98 @@ const PackHero = ({ opened, ripping, onRip }) => {
     );
   }
 
-  const p = progress;
-  const active = p > 0;
-  // Eased progress for smoother visual
-  const ep = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
-
-  // Flap transform values
-  const flapRotate = ep * 155;
-  const flapLift = ep * 40;
-  // Curl shading: as flap rotates past 90deg, show inner foil (silver)
-  const showInner = flapRotate > 85;
-  const innerOpacity = Math.max(0, (flapRotate - 85) / 70);
-  // Shadow under flap grows with progress
-  const shadowBlur = 4 + ep * 20;
-  const shadowY = 2 + ep * 8;
-  // Gap between flap and body for card peek
-  const gapPx = ep * 20;
-
-  // Inline SVG for jagged clip
-  const svgClipTop = `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 ${packW} ${packH}'><clipPath id='c' clipPathUnits='objectBoundingBox'><polygon points='${tearTop.split(" ").map(pt => { const [x, y] = pt.split(","); return `${(x / packW).toFixed(4)},${(y / packH).toFixed(4)}`; }).join(" ")}'/></clipPath></svg>`)}")`;
-  // Use polygon clip-path directly (better browser support)
-  const topClipPts = tearTop.split(" ").map(pt => { const [x, y] = pt.split(","); return `${(x / packW * 100).toFixed(2)}% ${(y / packH * 100).toFixed(2)}%`; }).join(", ");
-  const botClipPts = tearBottom.split(" ").map(pt => { const [x, y] = pt.split(","); return `${(x / packW * 100).toFixed(2)}% ${(y / packH * 100).toFixed(2)}%`; }).join(", ");
-  const topClip = `polygon(${topClipPts})`;
-  const botClip = `polygon(${botClipPts})`;
-
   return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", position: "relative" }}>
       <div style={{ position: "absolute", inset: 0, opacity: 0.03, backgroundImage: "repeating-conic-gradient(rgba(0,0,0,0.03) 0% 25%, transparent 0% 50%)", backgroundSize: "24px 24px", pointerEvents: "none" }} />
 
       <div
-        ref={packRef}
-        onMouseDown={handlePointerDown}
-        onTouchStart={handlePointerDown}
+        onClick={handleRip}
         onMouseEnter={() => setHov(true)}
         onMouseLeave={() => setHov(false)}
-        style={{ position: "relative", width: packW, height: packH, touchAction: "none", userSelect: "none", cursor: finishing ? "default" : active ? "grabbing" : "grab" }}
+        style={{
+          position: "relative", width: packW, height: packH,
+          cursor: torn ? "default" : "pointer",
+        }}
       >
-        {!finishing ? (
-          <div style={{ position: "absolute", inset: 0, animation: active ? "none" : "breathe 3s ease-in-out infinite" }}>
-
-            {/* ── Pack body (below tear line) ── */}
-            <div style={{
-              position: "absolute", inset: 0, borderRadius: 10,
-              clipPath: active ? botClip : "none",
-              background: T.holoGrad, backgroundSize: "300% 300%",
-              animation: "holoShimmer 3s ease infinite",
-              opacity: hov || active ? 1 : 0.7,
-              boxShadow: hov || active ? "0 30px 60px rgba(0,0,0,0.2), 0 0 40px rgba(184,150,78,0.15)" : "0 16px 40px rgba(0,0,0,0.12)",
-              transition: active ? "none" : `all 0.5s ${T.easeOut}`,
-              transform: hov && !active ? "scale(1.03)" : "scale(1)",
-            }} />
-            <div style={{
-              position: "absolute", inset: 4, borderRadius: 7,
-              clipPath: active ? botClip : "none",
-              background: T.cardBack,
-              display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10,
-            }}>
-              <div style={{ position: "absolute", inset: 10, border: "1.5px solid rgba(184,150,78,0.15)", borderRadius: 4 }} />
-              <div style={{ width: 40, height: 40, border: "2px solid rgba(184,150,78,0.25)", transform: "rotate(45deg)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <div style={{ width: 20, height: 20, border: "1.5px solid rgba(184,150,78,0.15)" }} />
-              </div>
-              <div style={{ fontFamily: T.serif, fontSize: 24, color: "rgba(255,255,255,0.85)", letterSpacing: "-0.02em" }}>Tri Pham</div>
-              <div style={{ fontFamily: T.mono, fontSize: 8, color: "rgba(255,255,255,0.3)", letterSpacing: "0.2em" }}>KAI株式会社 · TOKYO</div>
-              <div style={{ position: "absolute", bottom: 24, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, opacity: active ? 0 : 1, transition: "opacity 0.3s" }}>
-                <div style={{ width: 30, height: 1, background: hov ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.12)", transition: "all 0.4s" }} />
-                <span style={{ fontFamily: T.mono, fontSize: 8, color: hov ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.15)", letterSpacing: "0.2em", transition: "all 0.4s" }}>RIP OPEN</span>
-              </div>
+        {/* ── Pack body (always visible) ── */}
+        <div style={{
+          position: "absolute", inset: 0,
+          animation: torn ? "none" : "breathe 3s ease-in-out infinite",
+        }}>
+          <div style={{
+            position: "absolute", inset: 0, borderRadius: 10,
+            background: T.holoGrad, backgroundSize: "300% 300%",
+            animation: "holoShimmer 3s ease infinite",
+            opacity: hov || torn ? 1 : 0.7,
+            boxShadow: hov ? "0 30px 60px rgba(0,0,0,0.2), 0 0 40px rgba(184,150,78,0.15)" : "0 16px 40px rgba(0,0,0,0.12)",
+            transition: `all 0.5s ${T.easeOut}`,
+            transform: hov && !torn ? "scale(1.03)" : "scale(1)",
+          }} />
+          <div style={{
+            position: "absolute", inset: 4, borderRadius: 7,
+            background: T.cardBack,
+            display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10,
+          }}>
+            <div style={{ position: "absolute", inset: 10, border: "1.5px solid rgba(184,150,78,0.15)", borderRadius: 4 }} />
+            <div style={{ width: 40, height: 40, border: "2px solid rgba(184,150,78,0.25)", transform: "rotate(45deg)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <div style={{ width: 20, height: 20, border: "1.5px solid rgba(184,150,78,0.15)" }} />
             </div>
-
-            {/* ── Exposed cards underneath ── */}
-            {active && (
-              <div style={{
-                position: "absolute", left: 6, right: 6,
-                top: flapH - 6, height: gapPx + 12,
-                overflow: "hidden", pointerEvents: "none",
-                opacity: Math.min(1, p * 4),
-                filter: `brightness(${0.7 + p * 0.3})`,
-              }}>
-                <div style={{ position: "absolute", left: 0, right: 0, top: 0, height: packH * 0.5 }}>
-                  <CardBackDesign />
-                </div>
-              </div>
-            )}
-
-            {/* ── Shadow under lifted flap ── */}
-            {active && (
-              <div style={{
-                position: "absolute", left: 10, right: 10,
-                top: flapH - 4, height: 6,
-                background: `rgba(0,0,0,${0.08 + ep * 0.12})`,
-                filter: `blur(${shadowBlur}px)`,
-                borderRadius: "50%",
-                pointerEvents: "none", zIndex: 2,
-              }} />
-            )}
-
-            {/* ── Top flap (peels up with jagged edge + inner foil) ── */}
-            {active && (
-              <div style={{
-                position: "absolute", left: 0, right: 0, top: 0,
-                height: flapH + 4,
-                overflow: "visible",
-                transformOrigin: "center bottom",
-                transform: `perspective(800px) rotateX(${flapRotate}deg) translateY(${-flapLift}px)`,
-                transition: dragging ? "none" : `transform 0.4s ${T.easeOut}`,
-                zIndex: 4, pointerEvents: "none",
-                filter: `drop-shadow(0 ${shadowY}px ${shadowBlur}px rgba(0,0,0,0.25))`,
-              }}>
-                {/* Outer foil face */}
-                <div style={{
-                  position: "absolute", inset: 0,
-                  borderRadius: "10px 10px 0 0",
-                  background: T.holoGrad, backgroundSize: "300% 300%",
-                  animation: "holoShimmer 3s ease infinite",
-                  clipPath: topClip,
-                  opacity: showInner ? 1 - innerOpacity * 0.5 : 1,
-                }} />
-                {/* Dark body */}
-                <div style={{
-                  position: "absolute", left: 4, right: 4, top: 4, bottom: 0,
-                  borderRadius: "7px 7px 0 0",
-                  background: T.cardBack,
-                  clipPath: topClip,
-                }} />
-                {/* Inner foil face (visible when curled past 90°) */}
-                {showInner && (
-                  <div style={{
-                    position: "absolute", inset: 0,
-                    borderRadius: "10px 10px 0 0",
-                    background: "linear-gradient(180deg, #e8e0d4 0%, #c8bfb0 40%, #a89f90 100%)",
-                    clipPath: topClip,
-                    opacity: innerOpacity * 0.85,
-                  }} />
-                )}
-                {/* Holographic light catch on the curl fold */}
-                <div style={{
-                  position: "absolute", left: 0, right: 0, bottom: 0, height: 8,
-                  background: `linear-gradient(90deg, rgba(232,67,147,${0.2 + ep * 0.3}), rgba(107,92,231,${0.3 + ep * 0.3}), rgba(0,180,216,${0.2 + ep * 0.3}), rgba(212,160,23,${0.2 + ep * 0.2}))`,
-                  filter: `blur(${1 + ep * 2}px)`,
-                  opacity: Math.min(1, p * 5),
-                  clipPath: topClip,
-                }} />
-              </div>
-            )}
-
-            {/* ── Hover hint line ── */}
-            {!active && hov && (
-              <div style={{
-                position: "absolute", left: 8, right: 8, top: flapH + 2, height: 1,
-                background: "rgba(255,255,255,0.15)",
-                boxShadow: "0 0 6px rgba(232,67,147,0.1)",
-                zIndex: 2, pointerEvents: "none",
-              }} />
-            )}
-
-            {/* ── Foil confetti particles ── */}
-            {particles.map(pp => (
-              <div key={pp.id} style={{
-                position: "absolute",
-                left: `${pp.left}%`, top: flapH,
-                width: pp.size, height: pp.size,
-                background: pp.color,
-                borderRadius: pp.size > 3 ? 1 : "50%",
-                transform: `rotate(${pp.rot}deg)`,
-                animation: `particle ${pp.dur}s ${T.easeOut} forwards`,
-                "--px": `${pp.px}px`, "--py": `${pp.py}px`,
-                pointerEvents: "none", zIndex: 6,
-                boxShadow: `0 0 3px ${pp.color}40`,
-              }} />
-            ))}
+            <div style={{ fontFamily: T.serif, fontSize: 24, color: "rgba(255,255,255,0.85)", letterSpacing: "-0.02em" }}>Tri Pham</div>
+            <div style={{ fontFamily: T.mono, fontSize: 8, color: "rgba(255,255,255,0.3)", letterSpacing: "0.2em" }}>KAI株式会社 · TOKYO</div>
+            <div style={{ position: "absolute", bottom: 24, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, opacity: torn ? 0 : 1, transition: "opacity 0.3s" }}>
+              <div style={{ width: 30, height: 1, background: hov ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.12)", transition: "all 0.4s" }} />
+              <span style={{ fontFamily: T.mono, fontSize: 8, color: hov ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.15)", letterSpacing: "0.2em", transition: "all 0.4s" }}>RIP OPEN</span>
+            </div>
           </div>
-        ) : (
-          /* ── Auto-complete rip animation ── */
-          <div style={{ position: "relative", width: "100%", height: "100%" }}>
-            <div className="rip-top" style={{ position: "absolute", inset: 0, borderRadius: 10, overflow: "hidden", zIndex: 3 }}>
-              <div style={{ position: "absolute", inset: 0, background: T.holoGrad, backgroundSize: "300% 300%", animation: "holoShimmer 3s ease infinite" }} />
-              <div style={{ position: "absolute", inset: 4, borderRadius: 7, background: T.cardBack }} />
-            </div>
-            <div className="pack-body" style={{ position: "absolute", inset: 0, borderRadius: 10, overflow: "hidden", zIndex: 2 }}>
-              <div style={{ position: "absolute", inset: 0, background: T.holoGrad, backgroundSize: "300% 300%", animation: "holoShimmer 3s ease infinite" }} />
-              <div style={{ position: "absolute", inset: 4, borderRadius: 7, background: T.cardBack }} />
-            </div>
-            <div className="cards-spill" style={{ position: "absolute", inset: 6, zIndex: 1 }}><CardBackDesign /></div>
-            {Array.from({ length: 16 }).map((_, i) => (
-              <div key={i} className="foil-particle" style={{
-                left: `${10 + Math.random() * 80}%`, top: `${12 + Math.random() * 10}%`,
-                width: 2 + Math.random() * 3, height: 2 + Math.random() * 3,
-                background: ["#e84393", "#6b5ce7", "#00b4d8", "#d4a017", "#fff", "#f8b4d9", "#a78bfa"][i % 7],
-                "--px": `${(Math.random() - 0.5) * 80}px`, "--py": `${-25 - Math.random() * 60}px`,
-                animationDelay: `${Math.random() * 0.25}s`, zIndex: 4,
-                borderRadius: Math.random() > 0.5 ? "50%" : "1px",
-                boxShadow: `0 0 4px ${["#e84393", "#6b5ce7", "#00b4d8", "#d4a017"][i % 4]}30`,
-              }} />
-            ))}
+        </div>
+
+        {/* ── Cards revealed underneath after tear ── */}
+        {torn && (
+          <div className="cards-spill" style={{
+            position: "absolute", left: 6, right: 6, top: 6,
+            height: flapH - 4, overflow: "hidden", zIndex: 1,
+          }}>
+            <CardBackDesign />
           </div>
         )}
+
+        {/* ── Top flap — flies away on click ── */}
+        <div className={torn ? "tear-fly" : ""} style={{
+          position: "absolute", left: 0, right: 0, top: 0,
+          height: flapH + 4, zIndex: 5, pointerEvents: "none",
+          borderRadius: "10px 10px 0 0", overflow: "hidden",
+        }}>
+          <div style={{
+            position: "absolute", inset: 0,
+            background: T.holoGrad, backgroundSize: "300% 300%",
+            animation: "holoShimmer 3s ease infinite",
+          }} />
+          <div style={{
+            position: "absolute", left: 4, right: 4, top: 4, bottom: 0,
+            borderRadius: "7px 7px 0 0",
+            background: T.cardBack,
+          }} />
+        </div>
+
+        {/* ── Foil particles burst on rip ── */}
+        {torn && Array.from({ length: 14 }).map((_, i) => (
+          <div key={i} className="foil-particle" style={{
+            left: `${8 + Math.random() * 84}%`,
+            top: flapH,
+            width: 2 + Math.random() * 3, height: 2 + Math.random() * 3,
+            background: ["#e84393", "#6b5ce7", "#00b4d8", "#d4a017", "#fff", "#f8b4d9", "#a78bfa"][i % 7],
+            "--px": `${(Math.random() - 0.5) * 80}px`,
+            "--py": `${-20 - Math.random() * 50}px`,
+            animationDelay: `${Math.random() * 0.15}s`,
+            borderRadius: Math.random() > 0.5 ? "50%" : "1px",
+            zIndex: 6,
+          }} />
+        ))}
       </div>
 
-      {!active && !finishing && (
+      {!torn && (
         <div style={{ marginTop: 32, fontFamily: T.mono, fontSize: 10, color: T.textDim, letterSpacing: "0.1em", opacity: hov ? 1 : 0.5, transition: "opacity 0.3s" }}>
-          drag top to rip open
+          click to rip open
         </div>
       )}
     </div>
