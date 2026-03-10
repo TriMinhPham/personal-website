@@ -323,19 +323,168 @@ const CardBackDesign = ({ width = "100%", height = "100%" }) => (
 
 const FLAP_PCT = 0.20;
 
+// Generate deterministic jagged tear offsets
+const TEAR_SEGMENTS = 24;
+const tearOffsets = (() => {
+  let s = 42;
+  const rng = () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+  return Array.from({ length: TEAR_SEGMENTS + 1 }, () => (rng() - 0.5) * 10);
+})();
+
 const PackHero = ({ opened, ripping, onRip }) => {
   const [hov, setHov] = useState(false);
-  const [torn, setTorn] = useState(false); // top has been ripped off
+  const [tearProgress, setTearProgress] = useState(0); // 0..1, how far the tear has gone (left to right)
+  const [flyAway, setFlyAway] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const packRef = useRef(null);
+  const dragStartX = useRef(0);
+  const lastProgress = useRef(0);
+  const particlesRef = useRef([]);
 
   const packW = 240;
   const packH = packW * CARD_RATIO;
   const flapH = packH * FLAP_PCT;
 
-  const handleRip = () => {
-    if (torn || opened) return;
-    setTorn(true);
-    playRipSFX();
-    setTimeout(() => onRip(), 800);
+  const active = tearProgress > 0;
+  const done = tearProgress >= 1;
+
+  // Generate particles along the tear seam as it progresses
+  const spawnParticles = useCallback((progress) => {
+    const colors = ["#e84393", "#6b5ce7", "#00b4d8", "#d4a017", "#fff", "#f8b4d9", "#a78bfa"];
+    const x = progress * 100;
+    const count = 2;
+    const newP = [];
+    for (let i = 0; i < count; i++) {
+      newP.push({
+        id: Math.random(),
+        left: x + (Math.random() - 0.5) * 10,
+        color: colors[Math.floor(Math.random() * colors.length)],
+        size: 2 + Math.random() * 3,
+        px: (Math.random() - 0.5) * 40,
+        py: -15 - Math.random() * 40,
+        dur: 0.4 + Math.random() * 0.3,
+      });
+    }
+    particlesRef.current = [...particlesRef.current.slice(-20), ...newP];
+    // Clean up old particles
+    newP.forEach(p => setTimeout(() => {
+      particlesRef.current = particlesRef.current.filter(pp => pp.id !== p.id);
+    }, p.dur * 1000));
+  }, []);
+
+  // Play crinkle micro-SFX during drag
+  const playCrinkleSFX = useCallback(() => {
+    try {
+      const ctx = getAudio();
+      const t = ctx.currentTime;
+      const n = ctx.createBufferSource();
+      n.buffer = makeNoise(ctx, 0.06);
+      const bp = ctx.createBiquadFilter();
+      bp.type = "bandpass"; bp.frequency.value = 3500 + Math.random() * 3000; bp.Q.value = 1.2;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.04 + Math.random() * 0.04, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+      n.connect(bp); bp.connect(g); g.connect(ctx.destination);
+      n.start(t);
+    } catch (e) {}
+  }, []);
+
+  const getClientX = (e) => {
+    if (e.touches && e.touches.length > 0) return e.touches[0].clientX;
+    return e.clientX;
+  };
+
+  const handlePointerDown = useCallback((e) => {
+    if (flyAway || opened || done) return;
+    if (!packRef.current) return;
+    const rect = packRef.current.getBoundingClientRect();
+    const pos = e.touches ? e.touches[0] : e;
+    // Only start drag in the top ~35% of the pack
+    if ((pos.clientY - rect.top) / rect.height > 0.35) return;
+    e.preventDefault();
+    setDragging(true);
+    dragStartX.current = getClientX(e);
+    lastProgress.current = tearProgress;
+  }, [flyAway, opened, done, tearProgress]);
+
+  const handlePointerMove = useCallback((e) => {
+    if (!dragging || !packRef.current) return;
+    e.preventDefault();
+    const rect = packRef.current.getBoundingClientRect();
+    const dx = getClientX(e) - dragStartX.current;
+    // Map horizontal drag distance to tear progress (normalized to pack width)
+    const newP = Math.min(1, Math.max(0, lastProgress.current + dx / (rect.width * 0.9)));
+    if (newP > tearProgress) {
+      setTearProgress(newP);
+      // Spawn particles and crinkle at intervals
+      if (newP - tearProgress > 0.03) {
+        spawnParticles(newP);
+        playCrinkleSFX();
+      }
+    }
+  }, [dragging, tearProgress, spawnParticles, playCrinkleSFX]);
+
+  const handlePointerUp = useCallback(() => {
+    if (!dragging) return;
+    setDragging(false);
+    if (tearProgress >= 0.85) {
+      // Complete the tear
+      setTearProgress(1);
+      playRipSFX();
+      // Burst particles along the full seam
+      for (let i = 0; i < 5; i++) spawnParticles(Math.random());
+      setTimeout(() => {
+        setFlyAway(true);
+        setTimeout(() => onRip(), 600);
+      }, 100);
+    }
+  }, [dragging, tearProgress, onRip, spawnParticles]);
+
+  // Global pointer listeners for drag
+  useEffect(() => {
+    if (!dragging) return;
+    const move = (e) => handlePointerMove(e);
+    const up = () => handlePointerUp();
+    window.addEventListener("mousemove", move, { passive: false });
+    window.addEventListener("mouseup", up);
+    window.addEventListener("touchmove", move, { passive: false });
+    window.addEventListener("touchend", up);
+    return () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      window.removeEventListener("touchmove", move);
+      window.removeEventListener("touchend", up);
+    };
+  }, [dragging, handlePointerMove, handlePointerUp]);
+
+  // Build jagged tear clip-path: everything LEFT of the tear progress is torn away
+  // The tear line is a jagged vertical line at x = tearProgress * packW
+  const buildTearClip = (side) => {
+    const tearX = tearProgress * packW;
+    const pts = [];
+    if (side === "top") {
+      // Top flap: from left edge to the jagged tear line
+      pts.push("0% 0%");
+      // Along the tear line (top to bottom of flap)
+      for (let i = 0; i <= TEAR_SEGMENTS; i++) {
+        const y = (i / TEAR_SEGMENTS) * 100;
+        const jag = tearOffsets[i] * (tearProgress > 0.02 ? 1 : 0);
+        const x = Math.min(100, Math.max(0, (tearX + jag) / packW * 100));
+        pts.push(`${x.toFixed(2)}% ${y.toFixed(2)}%`);
+      }
+      pts.push("0% 100%");
+    } else {
+      // Remaining (right side stays attached): from tear line to right edge
+      for (let i = 0; i <= TEAR_SEGMENTS; i++) {
+        const y = (i / TEAR_SEGMENTS) * 100;
+        const jag = tearOffsets[i] * (tearProgress > 0.02 ? 1 : 0);
+        const x = Math.min(100, Math.max(0, (tearX + jag) / packW * 100));
+        pts.push(`${x.toFixed(2)}% ${y.toFixed(2)}%`);
+      }
+      pts.push("100% 100%");
+      pts.push("100% 0%");
+    }
+    return `polygon(${pts.join(", ")})`;
   };
 
   if (opened) {
@@ -357,27 +506,30 @@ const PackHero = ({ opened, ripping, onRip }) => {
       <div style={{ position: "absolute", inset: 0, opacity: 0.03, backgroundImage: "repeating-conic-gradient(rgba(0,0,0,0.03) 0% 25%, transparent 0% 50%)", backgroundSize: "24px 24px", pointerEvents: "none" }} />
 
       <div
-        onClick={handleRip}
+        ref={packRef}
+        onMouseDown={handlePointerDown}
+        onTouchStart={handlePointerDown}
         onMouseEnter={() => setHov(true)}
         onMouseLeave={() => setHov(false)}
         style={{
           position: "relative", width: packW, height: packH,
-          cursor: torn ? "default" : "pointer",
+          cursor: active ? (dragging ? "grabbing" : "grab") : "pointer",
+          userSelect: "none", touchAction: "none",
         }}
       >
         {/* ── Pack body (always visible) ── */}
         <div style={{
           position: "absolute", inset: 0,
-          animation: torn ? "none" : "breathe 3s ease-in-out infinite",
+          animation: active ? "none" : "breathe 3s ease-in-out infinite",
         }}>
           <div style={{
             position: "absolute", inset: 0, borderRadius: 10,
             background: T.holoGrad, backgroundSize: "300% 300%",
             animation: "holoShimmer 3s ease infinite",
-            opacity: hov || torn ? 1 : 0.7,
+            opacity: hov || active ? 1 : 0.7,
             boxShadow: hov ? "0 30px 60px rgba(0,0,0,0.2), 0 0 40px rgba(184,150,78,0.15)" : "0 16px 40px rgba(0,0,0,0.12)",
             transition: `all 0.5s ${T.easeOut}`,
-            transform: hov && !torn ? "scale(1.03)" : "scale(1)",
+            transform: hov && !active ? "scale(1.03)" : "scale(1)",
           }} />
           <div style={{
             position: "absolute", inset: 4, borderRadius: 7,
@@ -390,60 +542,110 @@ const PackHero = ({ opened, ripping, onRip }) => {
             </div>
             <div style={{ fontFamily: T.serif, fontSize: 24, color: "rgba(255,255,255,0.85)", letterSpacing: "-0.02em" }}>Tri Pham</div>
             <div style={{ fontFamily: T.mono, fontSize: 8, color: "rgba(255,255,255,0.3)", letterSpacing: "0.2em" }}>KAI株式会社 · TOKYO</div>
-            <div style={{ position: "absolute", bottom: 24, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, opacity: torn ? 0 : 1, transition: "opacity 0.3s" }}>
+            <div style={{ position: "absolute", bottom: 24, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, opacity: active ? 0 : 1, transition: "opacity 0.3s" }}>
               <div style={{ width: 30, height: 1, background: hov ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.12)", transition: "all 0.4s" }} />
-              <span style={{ fontFamily: T.mono, fontSize: 8, color: hov ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.15)", letterSpacing: "0.2em", transition: "all 0.4s" }}>RIP OPEN</span>
+              <span style={{ fontFamily: T.mono, fontSize: 8, color: hov ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.15)", letterSpacing: "0.2em", transition: "all 0.4s" }}>DRAG TO RIP</span>
             </div>
           </div>
         </div>
 
-        {/* ── Cards revealed underneath after tear ── */}
-        {torn && (
-          <div className="cards-spill" style={{
-            position: "absolute", left: 6, right: 6, top: 6,
-            height: flapH - 4, overflow: "hidden", zIndex: 1,
+        {/* ── Card back peeking through the torn area ── */}
+        {active && (
+          <div style={{
+            position: "absolute", left: 4, right: 4, top: 4,
+            height: flapH, overflow: "hidden", zIndex: 1,
+            borderRadius: "7px 7px 0 0",
+            clipPath: buildTearClip("top"),
           }}>
             <CardBackDesign />
           </div>
         )}
 
-        {/* ── Top flap — flies away on click ── */}
-        <div className={torn ? "tear-fly" : ""} style={{
-          position: "absolute", left: 0, right: 0, top: 0,
-          height: flapH + 4, zIndex: 5, pointerEvents: "none",
-          borderRadius: "10px 10px 0 0", overflow: "hidden",
-        }}>
+        {/* ── Top flap: the torn piece that follows the finger ── */}
+        {active && !flyAway && (
           <div style={{
-            position: "absolute", inset: 0,
-            background: T.holoGrad, backgroundSize: "300% 300%",
-            animation: "holoShimmer 3s ease infinite",
-          }} />
-          <div style={{
-            position: "absolute", left: 4, right: 4, top: 4, bottom: 0,
-            borderRadius: "7px 7px 0 0",
-            background: T.cardBack,
-          }} />
-        </div>
+            position: "absolute", left: 0, right: 0, top: 0,
+            height: flapH + 4, zIndex: 5, pointerEvents: "none",
+            borderRadius: "10px 10px 0 0", overflow: "hidden",
+            clipPath: buildTearClip("top"),
+          }}>
+            <div style={{
+              position: "absolute", inset: 0,
+              background: T.holoGrad, backgroundSize: "300% 300%",
+              animation: "holoShimmer 3s ease infinite",
+            }} />
+            <div style={{
+              position: "absolute", left: 4, right: 4, top: 4, bottom: 0,
+              borderRadius: "7px 7px 0 0",
+              background: T.cardBack,
+            }} />
+          </div>
+        )}
 
-        {/* ── Foil particles burst on rip ── */}
-        {torn && Array.from({ length: 14 }).map((_, i) => (
-          <div key={i} className="foil-particle" style={{
-            left: `${8 + Math.random() * 84}%`,
-            top: flapH,
-            width: 2 + Math.random() * 3, height: 2 + Math.random() * 3,
-            background: ["#e84393", "#6b5ce7", "#00b4d8", "#d4a017", "#fff", "#f8b4d9", "#a78bfa"][i % 7],
-            "--px": `${(Math.random() - 0.5) * 80}px`,
-            "--py": `${-20 - Math.random() * 50}px`,
-            animationDelay: `${Math.random() * 0.15}s`,
+        {/* ── Torn piece flies away after complete tear ── */}
+        {flyAway && (
+          <div className="tear-fly" style={{
+            position: "absolute", left: 0, right: 0, top: 0,
+            height: flapH + 4, zIndex: 5, pointerEvents: "none",
+            borderRadius: "10px 10px 0 0", overflow: "hidden",
+          }}>
+            <div style={{
+              position: "absolute", inset: 0,
+              background: T.holoGrad, backgroundSize: "300% 300%",
+              animation: "holoShimmer 3s ease infinite",
+            }} />
+            <div style={{
+              position: "absolute", left: 4, right: 4, top: 4, bottom: 0,
+              borderRadius: "7px 7px 0 0",
+              background: T.cardBack,
+            }} />
+          </div>
+        )}
+
+        {/* ── Top flap (untorn portion stays on pack) ── */}
+        {active && (
+          <div style={{
+            position: "absolute", left: 0, right: 0, top: 0,
+            height: flapH + 4, zIndex: 3, pointerEvents: "none",
+            borderRadius: "10px 10px 0 0", overflow: "hidden",
+            clipPath: buildTearClip("right"),
+          }}>
+            <div style={{
+              position: "absolute", inset: 0,
+              background: T.holoGrad, backgroundSize: "300% 300%",
+              animation: "holoShimmer 3s ease infinite",
+            }} />
+            <div style={{
+              position: "absolute", left: 4, right: 4, top: 4, bottom: 0,
+              borderRadius: "7px 7px 0 0",
+              background: T.cardBack,
+            }} />
+          </div>
+        )}
+
+        {/* ── Foil particles along the tear seam ── */}
+        {particlesRef.current.map(p => (
+          <div key={p.id} className="foil-particle" style={{
+            left: `${p.left}%`,
+            top: flapH / 2,
+            width: p.size, height: p.size,
+            background: p.color,
+            "--px": `${p.px}px`,
+            "--py": `${p.py}px`,
             borderRadius: Math.random() > 0.5 ? "50%" : "1px",
             zIndex: 6,
           }} />
         ))}
       </div>
 
-      {!torn && (
+      {!active && (
         <div style={{ marginTop: 32, fontFamily: T.mono, fontSize: 10, color: T.textDim, letterSpacing: "0.1em", opacity: hov ? 1 : 0.5, transition: "opacity 0.3s" }}>
-          click to rip open
+          drag across the top to rip open
+        </div>
+      )}
+      {active && !done && (
+        <div style={{ marginTop: 32, fontFamily: T.mono, fontSize: 10, color: T.textDim, letterSpacing: "0.1em" }}>
+          {Math.round(tearProgress * 100)}% — keep dragging →
         </div>
       )}
     </div>
